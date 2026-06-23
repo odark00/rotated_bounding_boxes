@@ -1,19 +1,30 @@
+"""
+Inference script for RTMDet-Rotated parcel detector.
+
+Usage:
+    python predict.py --ckpt model.ckpt --image img.png
+    python predict.py --ckpt model.ckpt --image img.png \\
+        --intrinsics 1100 1100 320 320   # fx fy cx cy of original image
+
+Output per detection:
+    score, cx_px, cy_px, w_px, h_px, angle_deg,
+    depth_m,  W_3d_m, L_3d_m, H_3d_m
+"""
+
 import argparse
-import torch
+import math
 import numpy as np
-from PIL import Image
+import torch
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.patches import FancyArrowPatch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from PIL import Image
 
-from losses import Parcel3DLitModule
+from losses import RTMDetLitModule
 
-
-CORNER_EDGES = [
-    (0,1),(1,2),(2,3),(3,0),
-    (4,5),(5,6),(6,7),(7,4),
-    (0,4),(1,5),(2,6),(3,7),
-]
+STRIDES = [8, 16, 32]
 
 FACES = [
     [0,1,2,3], [4,5,6,7],
@@ -22,236 +33,224 @@ FACES = [
 ]
 
 
-def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def decode_level(out, stride, score_thresh):
+    """Decode one FPN level → list of raw detections."""
+    B, _, H, W = out['cls'].shape
+    assert B == 1
+
+    scores = out['cls'][0, 0].sigmoid().flatten()        # (M,)
+    keep   = scores > score_thresh
+    if keep.sum() == 0:
+        return None
+
+    def _g(k): return out[k][0, 0].flatten()[keep].cpu().numpy()
+
+    return dict(
+        scores =scores[keep].cpu().numpy(),
+        cx     =_g('cx'),  cy    =_g('cy'),
+        w      =_g('w'),   h     =_g('h'),
+        sin_a  =_g('sin_a'), cos_a=_g('cos_a'),
+        depth  =_g('depth'),
+        height3d=_g('height3d'),
+    )
+
+
+def nms_rotated(dets, iou_thresh=0.5):
+    """Simple centre-distance NMS (avoids rotated-IoU complexity)."""
+    if len(dets['scores']) == 0:
+        return dets
+
+    idx  = np.argsort(-dets['scores'])
+    keep = []
+    used = np.zeros(len(idx), bool)
+    cx, cy = dets['cx'], dets['cy']
+    ww, hh = dets['w'], dets['h']
+
+    for ii, i in enumerate(idx):
+        if used[ii]:
+            continue
+        keep.append(i)
+        for jj, j in enumerate(idx[ii+1:], ii+1):
+            if used[jj]:
+                continue
+            dist   = math.hypot(cx[i]-cx[j], cy[i]-cy[j])
+            radius = 0.5 * (max(ww[i], hh[i]) + max(ww[j], hh[j]))
+            if dist < radius * iou_thresh:
+                used[jj] = True
+
+    return {k: v[keep] for k, v in dets.items()}
+
+
+def build_corners_3d(cx_px, cy_px, depth, W3d, L3d, H3d, angle, fx, fy, cx_K, cy_K):
     """
-    Convert 6D rotation representation (Zhou et al. 2019) to 3x3 rotation matrix.
-    rot6d: (..., 6)
-    returns: (..., 3, 3)
+    Reconstruct 8 corners of the 3D box in image-space 3D
+    (x right, y down, z forward — OpenCV convention).
+
+    angle : rotation of the W-axis in the image plane (radians).
     """
-    a1 = rot6d[..., :3]
-    a2 = rot6d[..., 3:6]
-    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
-    b2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
-    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=-1)  # (..., 3, 3)
+    X = (cx_px - cx_K) * depth / fx
+    Y = (cy_px - cy_K) * depth / fy
+    Z = depth
+    center = np.array([X, Y, Z])
 
+    ca, sa = math.cos(angle), math.sin(angle)
+    # W axis: along angle in image plane (horizontal)
+    uW = np.array([ ca,  sa, 0.0])
+    # L axis: perpendicular to W in image plane
+    uL = np.array([-sa,  ca, 0.0])
+    # H axis: depth direction (into scene)
+    uH = np.array([0.0, 0.0, 1.0])
 
-def build_corners_numpy(centers: np.ndarray,
-                        sizes: np.ndarray,
-                        rot6d: np.ndarray) -> np.ndarray:
-    """
-    Build 8 corners of each 3D box in camera frame.
-
-    centers : (N, 3)
-    sizes   : (N, 3)  w, h, d
-    rot6d   : (N, 6)
-    returns : (N, 8, 3)
-    """
-    N = centers.shape[0]
-    R = rot6d_to_matrix(rot6d)  # (N, 3, 3)
-
-    # unit cube corners: ±0.5 along each axis
-    offsets = np.array([
-        [-0.5, -0.5, -0.5],
-        [ 0.5, -0.5, -0.5],
-        [ 0.5,  0.5, -0.5],
-        [-0.5,  0.5, -0.5],
-        [-0.5, -0.5,  0.5],
-        [ 0.5, -0.5,  0.5],
-        [ 0.5,  0.5,  0.5],
-        [-0.5,  0.5,  0.5],
-    ], dtype=np.float32)  # (8, 3)
-
-    corners = np.zeros((N, 8, 3), dtype=np.float32)
-    for i in range(N):
-        # scale unit cube by box size
-        scaled = offsets * sizes[i]          # (8, 3)
-        # rotate
-        rotated = scaled @ R[i].T            # (8, 3)
-        # translate
-        corners[i] = rotated + centers[i]   # (8, 3)
-
+    hw, hl, hh = W3d/2, L3d/2, H3d/2
+    signs = [(-1,-1,-1),( 1,-1,-1),( 1, 1,-1),(-1, 1,-1),
+             (-1,-1, 1),( 1,-1, 1),( 1, 1, 1),(-1, 1, 1)]
+    corners = np.array([center + sw*hw*uW + sl*hl*uL + sh*hh*uH
+                        for sw, sl, sh in signs])
     return corners
 
 
-def unproject(uv_norm: np.ndarray,
-              depth: np.ndarray,
-              K: np.ndarray,
-              img_w: int = 640,
-              img_h: int = 640) -> np.ndarray:
-    """
-    Lift normalised pixel coordinates + depth to 3D camera-frame points.
-
-    uv_norm : (N, 2)  values in [0, 1]
-    depth   : (N,)    metric depth (z-forward)
-    K       : (3, 3)  intrinsics for the 640×640 model space
-    returns : (N, 3)
-    """
-    # convert normalised coords to pixel coords
-    px = uv_norm[:, 0] * img_w   # u
-    py = uv_norm[:, 1] * img_h   # v
-
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-
-    x = (px - cx) / fx * depth
-    y = (py - cy) / fy * depth
-    z = depth
-
-    return np.stack([x, y, z], axis=-1)  # (N, 3)
+def project_to_image(corners_3d, fx, fy, cx_K, cy_K):
+    """Project (N,3) OpenCV-frame 3D points to pixel (N,2)."""
+    z   = np.clip(corners_3d[:, 2:3], 1e-3, None)
+    xy  = corners_3d[:, :2] / z
+    uv  = xy * np.array([[fx, fy]]) + np.array([[cx_K, cy_K]])
+    return uv
 
 
-def project_corners(corners: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """
-    Project 3D corners (z-forward camera frame) to 2D image pixels.
+def draw_rotated_rect(ax, cx, cy, w, h, angle_rad, **kw):
+    """Draw an oriented rectangle on a matplotlib axis."""
+    ca, sa  = math.cos(angle_rad), math.sin(angle_rad)
+    hw, hh  = w / 2, h / 2
+    corners = np.array([
+        [-hw, -hh], [ hw, -hh], [ hw,  hh], [-hw,  hh]
+    ])
+    R     = np.array([[ca, -sa], [sa, ca]])
+    rotc  = corners @ R.T + np.array([cx, cy])
+    poly  = plt.Polygon(rotc, fill=False, **kw)
+    ax.add_patch(poly)
+    # draw centre direction arrow
+    ax.annotate('', xy=(cx + ca*hw*0.6, cy + sa*hw*0.6),
+                xytext=(cx, cy),
+                arrowprops=dict(arrowstyle='->', color=kw.get('edgecolor','lime'), lw=1.5))
 
-    corners : (N, 8, 3)
-    K       : (3, 3)
-    returns : (N, 8, 2)
-    """
-    pts = corners.copy()
-    z = np.clip(pts[..., 2:3], 1e-3, None)
-    uv = pts[..., :2] / z
-    uv = uv @ K[:2, :2].T + K[:2, 2]
-    return uv  # (N, 8, 2)
 
-
+# ---------------------------------------------------------------------------
+# Main predict
+# ---------------------------------------------------------------------------
 @torch.no_grad()
-def predict(ckpt: str,
-            image_path: str,
-            conf_thresh: float = 0.5,
-            K: np.ndarray | None = None,
-            out_path: str = "prediction.png",
-            intrinsics: tuple | None = None):
+def predict(ckpt, image_path, conf_thresh=0.5, intrinsics=None, out_path="prediction.png"):
 
-    # ------------------------------------------------------------------ model
-    model = Parcel3DLitModule.load_from_checkpoint(ckpt, map_location="cpu")
+    model = RTMDetLitModule.load_from_checkpoint(ckpt, map_location="cpu")
     model.eval()
 
-    # ------------------------------------------------------------------ image
-    img = Image.open(image_path).convert("L")
+    img    = Image.open(image_path).convert("L")
     W0, H0 = img.size
+    tfm    = T.Compose([T.Resize((640, 640)), T.ToTensor(), T.Normalize([0.5],[0.5])])
+    x      = tfm(img).unsqueeze(0)
 
-    tfm = T.Compose([
-        T.Resize((640, 640)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.5], std=[0.5]),
-    ])
-    x = tfm(img).unsqueeze(0)  # (1, 1, 640, 640)
+    # ---- intrinsics ----
+    if intrinsics is not None:
+        fx_orig, fy_orig, cx_orig, cy_orig = intrinsics
+        sx, sy = 640.0/W0, 640.0/H0
+        fx_m, fy_m = fx_orig*sx, fy_orig*sy
+        cx_m, cy_m = cx_orig*sx, cy_orig*sy
+    else:
+        fx_m = fy_m = 1100.0
+        cx_m = cy_m = 320.0
+        fx_orig = fy_orig = 1100.0
+        cx_orig, cy_orig = W0/2, H0/2
 
-    # ---------------------------------------------------------------- forward
-    out = model(x)
+    level_outs = model.model(x)
 
-    # out keys: pred_logits (1,Q,2), pred_uv (1,Q,2), pred_depth (1,Q,1),
-    #           pred_size (1,Q,3),   pred_rot6d (1,Q,6)
-    probs  = out["pred_logits"].softmax(-1)[0]   # (Q, 2)
-    scores = probs[:, 1]                          # foreground score
-    keep   = scores > conf_thresh
+    # ---- decode all levels ----
+    all_dets = {k: [] for k in
+                ['scores','cx','cy','w','h','sin_a','cos_a','depth','height3d']}
+    for out, stride in zip(level_outs, STRIDES):
+        d = decode_level(out, stride, conf_thresh)
+        if d is not None:
+            for k in all_dets:
+                all_dets[k].append(d[k])
 
-    if keep.sum() == 0:
-        print("No parcels detected above confidence threshold.")
+    if not all_dets['scores']:
+        print("No parcels detected above threshold.")
         return
 
-    uv_norm = out["pred_uv"][0][keep].cpu().numpy()       # (N, 2)
-    depth   = out["pred_depth"][0][keep].squeeze(-1).cpu().numpy()  # (N,)
-    sizes   = out["pred_size"][0][keep].cpu().numpy()     # (N, 3)
-    rot6d   = out["pred_rot6d"][0][keep].cpu().numpy()    # (N, 6)
-    scores  = scores[keep].cpu().numpy()                  # (N,)
+    for k in all_dets:
+        all_dets[k] = np.concatenate(all_dets[k])
 
-    # ----------------------------------------- intrinsics (model space = 640×640)
-    if K is None:
-        if intrinsics is not None:
-            # intrinsics provided as (fx, fy, cx, cy) for the original image;
-            # rescale to 640×640 model space
-            fx, fy, cx, cy = intrinsics
-            sx, sy = 640.0 / W0, 640.0 / H0
-            K = np.array(
-                [[fx * sx,      0, cx * sx],
-                 [     0,  fy * sy, cy * sy],
-                 [     0,       0,       1]], dtype=np.float32
-            )
-        else:
-            K = np.array(
-                [[1100,   0, 320],
-                 [   0, 1100, 320],
-                 [   0,    0,   1]], dtype=np.float32
-            )
+    dets = nms_rotated(all_dets)
+    N = len(dets['scores'])
 
-    # lift UV + depth → 3D centers in camera frame (z-forward)
-    centers = unproject(uv_norm, depth, K, img_w=640, img_h=640)  # (N, 3)
+    # ---- 3D dimensions using intrinsics ----
+    W3d  = dets['w']      * dets['depth'] / fx_m
+    L3d  = dets['h']      * dets['depth'] / fy_m
+    H3d  = dets['height3d']
+    angles = np.arctan2(dets['sin_a'], dets['cos_a'])
+    angles[angles < 0] += math.pi    # canonicalise to [0, π)
 
-    # build 8-corner boxes
-    corners = build_corners_numpy(centers, sizes, rot6d)  # (N, 8, 3)
+    print(f"\nDetected {N} parcel(s):")
+    for i in range(N):
+        print(f"  [{i}] score={dets['scores'][i]:.3f}"
+              f"  cx={dets['cx'][i]:.1f}px  cy={dets['cy'][i]:.1f}px"
+              f"  angle={math.degrees(angles[i]):.1f}°"
+              f"  depth={dets['depth'][i]:.4f}m"
+              f"  W={W3d[i]:.4f}m  L={L3d[i]:.4f}m  H={H3d[i]:.4f}m")
 
-    # ----------------------------------------------------------------- report
-    print(f"Detected {len(corners)} parcel(s)")
-    for i in range(len(corners)):
-        w, l, h = sizes[i]
-        print(
-            f"  [{i}] score={scores[i]:.3f}"
-            f"  center={[round(v,4) for v in centers[i].tolist()]}"
-            f"  W={w:.4f}m  L={l:.4f}m  H={h:.4f}m"
-            f"  depth={depth[i]:.4f}m"
-        )
-
-    # --------------------------------------------------------------- visualise
+    # ---- visualise ----
     fig = plt.figure(figsize=(14, 6))
 
-    # -- 2D projection over original image --
+    # --- 2D rotated boxes on image ---
     ax1 = fig.add_subplot(1, 2, 1)
     ax1.imshow(np.array(img), cmap="gray")
-
-    # rescale intrinsics from 640×640 model space → original image resolution
-    sx, sy = W0 / 640.0, H0 / 640.0
-    K_img = K.copy()
-    K_img[0] *= sx
-    K_img[1] *= sy
-
-    # project corners using original-resolution intrinsics
-    uv_proj = project_corners(corners, K_img)  # (N, 8, 2)
-
-    for box in uv_proj:
-        for a, b in CORNER_EDGES:
-            ax1.plot(
-                [box[a, 0], box[b, 0]],
-                [box[a, 1], box[b, 1]],
-                color="lime", linewidth=2,
-            )
-    ax1.set_title("2D projection")
+    # rescale model-space coords to original image resolution
+    sx_v, sy_v = W0/640.0, H0/640.0
+    for i in range(N):
+        draw_rotated_rect(ax1,
+            dets['cx'][i]*sx_v, dets['cy'][i]*sy_v,
+            dets['w'][i]*sx_v,  dets['h'][i]*sy_v,
+            angles[i],
+            edgecolor='lime', linewidth=2,
+        )
+        ax1.text(dets['cx'][i]*sx_v, dets['cy'][i]*sy_v - dets['h'][i]*sy_v*0.6,
+                 f"{dets['scores'][i]:.2f}", color='yellow', fontsize=8, ha='center')
+    ax1.set_title("2D rotated boxes")
     ax1.axis("off")
 
-    # -- 3D view --
+    # --- 3D boxes ---
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-    for box in corners:
-        ax2.scatter(box[:, 0], box[:, 1], box[:, 2], s=10)
-        polys = [[box[i] for i in f] for f in FACES]
-        ax2.add_collection3d(
-            Poly3DCollection(polys, alpha=0.2, edgecolor="k")
+    for i in range(N):
+        corners = build_corners_3d(
+            dets['cx'][i], dets['cy'][i], dets['depth'][i],
+            W3d[i], L3d[i], H3d[i], angles[i],
+            fx_m, fy_m, cx_m, cy_m,
         )
-    ax2.set_xlabel("X")
-    ax2.set_ylabel("Y")
-    ax2.set_zlabel("Z")
-    ax2.set_title("3D bounding boxes (camera frame, z-forward)")
+        # project to original image for 3D-on-image overlay (optional)
+        polys = [[corners[j] for j in face] for face in FACES]
+        ax2.add_collection3d(Poly3DCollection(polys, alpha=0.2,
+                                               edgecolor='k', facecolor='cyan'))
+        ax2.scatter(corners[:,0], corners[:,1], corners[:,2], s=10)
 
+    ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z (depth)")
+    ax2.set_title("3D boxes (OpenCV frame, Z forward)")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
-    print(f"Saved → {out_path}")
+    print(f"\nSaved → {out_path}")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt",  required=True,  help="Lightning checkpoint (.ckpt)")
-    p.add_argument("--image", required=True,  help="Input image path")
-    p.add_argument("--conf",  type=float, default=0.5, help="Confidence threshold")
-    p.add_argument("--out",   type=str,   default="prediction.png")
-    p.add_argument(
-        "--intrinsics", type=float, nargs=4,
-        metavar=("FX", "FY", "CX", "CY"),
-        help="Camera intrinsics for the input image (fx fy cx cy). "
-             "Enables metric W/L/H estimation. If omitted, uses training defaults.",
-    )
+    p.add_argument("--ckpt",  required=True)
+    p.add_argument("--image", required=True)
+    p.add_argument("--conf",  type=float, default=0.5)
+    p.add_argument("--out",   default="prediction.png")
+    p.add_argument("--intrinsics", type=float, nargs=4,
+                   metavar=("FX","FY","CX","CY"),
+                   help="Camera intrinsics of the input image. "
+                        "Enables metric W/L/H estimation.")
     args = p.parse_args()
-
-    predict(args.ckpt, args.image, args.conf, out_path=args.out,
-            intrinsics=tuple(args.intrinsics) if args.intrinsics else None)
+    predict(args.ckpt, args.image, args.conf,
+            intrinsics=tuple(args.intrinsics) if args.intrinsics else None,
+            out_path=args.out)

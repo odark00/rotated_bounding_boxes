@@ -175,16 +175,45 @@ class ParcelDataset(Dataset):
     @staticmethod
     def _size_from_corners(bbox: torch.Tensor) -> torch.Tensor:
         """
-        Recover (w, h, d) from the 8 GT corners.
-
-        Corner ordering from Blender export:
-            0,1,2,3 — one face;  4,5,6,7 — opposite face
-            edges (0,1), (1,2), (0,4) are three orthogonal cube edges.
+        Recover (d01, d12, d04) from 8 GT corners.
+        d01 = box height (along camera optical axis)
+        d12, d04 = two horizontal dimensions (width, length)
         """
         d01 = (bbox[0] - bbox[1]).norm()
         d12 = (bbox[1] - bbox[2]).norm()
         d04 = (bbox[0] - bbox[4]).norm()
         return torch.stack([d01, d12, d04])
+
+    @staticmethod
+    def _rbox_from_corners(bbox_3d: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+        """
+        Compute 2D oriented bounding box (rbox) from 3D corners projected to image.
+
+        The top face of the box (closest to camera) uses corners [1,2,6,5]:
+          edge 1→2 has length d12  (one horizontal dim)
+          edge 1→5 has length d04  (other horizontal dim)
+
+        Returns (5,) = (cx_px, cy_px, w_px, h_px, angle_rad)
+          angle_rad in [0, π)  — angle of the d12 edge in image space
+          w_px corresponds to d12,  h_px corresponds to d04
+        """
+        uv, _ = project_blender(bbox_3d, K)          # (8,2)
+        top   = uv[[1, 2, 6, 5]]                      # (4,2) top face corners
+
+        cx = top[:, 0].mean()
+        cy = top[:, 1].mean()
+
+        e1 = top[1] - top[0]                          # d12 direction in 2D
+        e2 = top[3] - top[0]                          # d04 direction in 2D
+
+        w = e1.norm().clamp(min=1e-3)
+        h = e2.norm().clamp(min=1e-3)
+
+        angle = torch.atan2(e1[1], e1[0])             # angle of width edge
+        if angle < 0:
+            angle = angle + torch.pi                   # canonicalise to [0, π)
+
+        return torch.stack([cx, cy, w, h, angle])
 
     # ------------------------------------------------------------------ main
     def __getitem__(self, idx: int):
@@ -216,7 +245,7 @@ class ParcelDataset(Dataset):
         centers_list, uv_norm_list, uv_pixel_list = [], [], []
         depths_list, sizes_list = [], []
         rot6d_list, R_list, euler_list = [], [], []
-        corners_list, names = [], []
+        corners_list, rboxes_list, names = [], [], []
 
         for p in parcels:
             bbox_b = torch.tensor(p["bbox_3d_camera"], dtype=torch.float32)  # (8,3)
@@ -237,6 +266,9 @@ class ParcelDataset(Dataset):
 
             # metric size
             sizes_list.append(self._size_from_corners(bbox_b))
+
+            # 2D rotated bounding box target for RTMDet head
+            rboxes_list.append(self._rbox_from_corners(bbox_b, K_model))     # (5,)
 
             # rotation
             euler = torch.tensor(p["rotation"], dtype=torch.float32)
@@ -268,6 +300,7 @@ class ParcelDataset(Dataset):
             "R":           _stack(R_list,       (3, 3)),     # (N,3,3)
             "euler":       _stack(euler_list,   (3,)),       # (N,3) original Blender XYZ
             "boxes_3d":    _stack(corners_list, (8, 3)),     # (N,8,3) Blender frame GT corners
+            "rboxes":      _stack(rboxes_list,  (5,)),      # (N,5) cx,cy,w,h,angle (model px)
 
             # bookkeeping
             "labels":      torch.ones(n, dtype=torch.long),  # 1 = parcel

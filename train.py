@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from dataset import ParcelDataset, collate_fn
-from losses import Parcel3DLitModule
+from losses import RTMDetLitModule
 
 
 def main():
@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
+    torch.set_float32_matmul_precision("high")
     pl.seed_everything(42)
 
     full = ParcelDataset(args.images, args.labels, img_size=args.img_size,
@@ -42,7 +43,7 @@ def main():
                             num_workers=args.num_workers, collate_fn=collate_fn,
                             persistent_workers=args.num_workers > 0)
 
-    model = Parcel3DLitModule(num_queries=args.num_queries, lr=args.lr)
+    model = RTMDetLitModule(lr=args.lr)
 
     callbacks = [
         ModelCheckpoint(

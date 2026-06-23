@@ -1,138 +1,206 @@
+"""
+RTMDet-Rotated training module.
+
+Assignment  : top-k (k=9) anchor points per GT by centre distance per FPN level.
+Losses      : Focal (cls)  +  L1 (box, angle, depth, height3d)
+"""
+
 import torch
-from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from model import DETR3D
-from matcher import HungarianMatcher3D
-from geometry import lift_uv_depth_to_camera, build_corners_from_geometry
+
+from model import RTMDetRotated
 
 
-def _ortho6d(r):
-    """Normalise 6D rotation to orthogonal representation for loss."""
-    a1 = F.normalize(r[..., :3], dim=-1)
-    a2 = r[..., 3:6]
-    a2 = F.normalize(a2 - (a1 * a2).sum(-1, keepdim=True) * a1, dim=-1)
-    return torch.cat([a1, a2], dim=-1)
+# ---------------------------------------------------------------------------
+# Focal loss
+# ---------------------------------------------------------------------------
+def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+    """Binary focal loss. logits/targets: (N,) floats."""
+    p   = logits.sigmoid()
+    ce  = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    p_t = p * targets + (1 - p) * (1 - targets)
+    a_t = alpha * targets + (1 - alpha) * (1 - targets)
+    return (a_t * (1 - p_t) ** gamma * ce).mean()
 
 
-class Parcel3DLitModule(pl.LightningModule):
-    def __init__(self, num_queries=10, lr=1e-4, weight_decay=1e-4):
+# ---------------------------------------------------------------------------
+# Lightning module
+# ---------------------------------------------------------------------------
+class RTMDetLitModule(pl.LightningModule):
+
+    STRIDES = [8, 16, 32]
+
+    def __init__(self, lr=1e-4, weight_decay=1e-4,
+                 depth_range=(1.2, 1.5), height3d_range=(0.04, 0.30),
+                 top_k=9, img_size=640):
         super().__init__()
         self.save_hyperparameters()
-        self.model = DETR3D(num_queries=num_queries)
-        self.matcher = HungarianMatcher3D()
-        self.class_weight = torch.tensor([0.1, 1.0])
+        self.model    = RTMDetRotated(depth_range=depth_range, height3d_range=height3d_range)
+        self.top_k    = top_k
+        self.img_size = img_size
 
     def forward(self, x):
         return self.model(x)
 
-    def compute_loss(self, outputs, targets):
-        indices = self.matcher(outputs, targets)
-
-        # --- Classification loss ---
-        pred_logits = outputs["pred_logits"]   # (B, Q, 2)
-        B, Q, _ = pred_logits.shape
-
-        target_classes = torch.zeros(B, Q, dtype=torch.long, device=pred_logits.device)
-        for b, (qi, ti) in enumerate(indices):
-            target_classes[b, qi] = 1
-
-        loss_ce = F.cross_entropy(
-            pred_logits.reshape(-1, 2),
-            target_classes.reshape(-1),
-            weight=self.class_weight.to(pred_logits.device),
+    # ------------------------------------------------------------------
+    def _anchors(self, H, W, stride, device):
+        """Centre pixel coords of every grid cell: (H*W, 2)."""
+        gy, gx = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32) + 0.5,
+            torch.arange(W, device=device, dtype=torch.float32) + 0.5,
+            indexing='ij',
         )
+        return torch.stack([gx.flatten(), gy.flatten()], -1) * stride
 
-        # --- Regression losses on matched queries ---
-        loss_center = pred_logits.new_zeros(())
-        loss_size   = pred_logits.new_zeros(())
-        loss_rot    = pred_logits.new_zeros(())
-        loss_corner = pred_logits.new_zeros(())
-        n_total = 0
+    def _assign(self, gt_rboxes, anchors):
+        """
+        Top-k centre-distance assignment.
 
-        for b, (qi, ti) in enumerate(indices):
-            if qi.numel() == 0:
-                continue
+        gt_rboxes : (N, 5) = (cx, cy, w, h, angle)
+        anchors   : (M, 2) in pixels
+        Returns   : (M,) long, -1 = background, 0..N-1 = GT index
+        """
+        N = gt_rboxes.shape[0]
+        M = anchors.shape[0]
+        out = anchors.new_full((M,), -1, dtype=torch.long)
 
-            dev = pred_logits.device
-            K        = targets[b]["K"].to(dev)                      # (3,3)
-            img_size = targets[b]["img_size"].float().to(dev)        # [W,H]
+        if N == 0:
+            return out
 
-            pred_uv_norm = outputs["pred_uv"][b, qi]                # (n,2)
-            pred_depth   = outputs["pred_depth"][b, qi]             # (n,1)
-            pred_size    = outputs["pred_size"][b, qi]              # (n,3)
-            pred_rot6d   = outputs["pred_rot6d"][b, qi]             # (n,6)
+        dists = torch.cdist(anchors, gt_rboxes[:, :2])   # (M, N)
 
-            # UV [0,1] → pixel coords at model resolution
-            pred_uv_px = pred_uv_norm * img_size                    # (n,2)
+        for n in range(N):
+            d  = dists[:, n]
+            r  = 1.5 * max(gt_rboxes[n, 2].item(), gt_rboxes[n, 3].item())
+            ok = d < r
+            if ok.sum() == 0:
+                ok = (d == d.min())
 
-            tc       = targets[b]["centers"][ti].to(dev)            # (n,3) Blender frame
-            ts       = targets[b]["sizes"][ti].to(dev)              # (n,3)
-            tr6d     = targets[b]["rot6d"][ti].to(dev)              # (n,6)
-            tcorners = targets[b]["boxes_3d"][ti].to(dev)           # (n,8,3)
+            cand = d.clone().masked_fill(~ok, float('inf'))
+            k    = min(self.top_k, ok.sum().item())
+            _, idx = cand.topk(k, largest=False)
 
-            # Lift predicted UV+depth to 3D center (Blender camera frame)
-            pred_center = lift_uv_depth_to_camera(
-                pred_uv_px, pred_depth, K, blender_convention=True
-            )                                                        # (n,3)
+            for i in idx:
+                i = i.item()
+                if out[i] < 0 or d[i] < dists[i, out[i]]:
+                    out[i] = n
 
-            loss_center = loss_center + F.l1_loss(pred_center, tc, reduction="sum")
-            loss_size   = loss_size   + F.l1_loss(pred_size, ts, reduction="sum")
-            loss_rot    = loss_rot    + F.l1_loss(_ortho6d(pred_rot6d), _ortho6d(tr6d), reduction="sum")
+        return out
 
-            pred_corners = build_corners_from_geometry(
-                pred_uv_px, pred_depth, pred_size, pred_rot6d, K,
-                blender_convention=True
-            )                                                        # (n,8,3)
-            loss_corner = loss_corner + F.l1_loss(pred_corners, tcorners, reduction="sum")
-            n_total += qi.numel()
+    # ------------------------------------------------------------------
+    def compute_loss(self, level_outs, targets):
+        dev = level_outs[0]['cls'].device
+        S   = float(self.img_size)
 
-        n_total = max(n_total, 1)
-        loss_center = loss_center / n_total
-        loss_size = loss_size / n_total
-        loss_rot = loss_rot / n_total
-        loss_corner = loss_corner / (n_total * 8)
+        loss_cls   = torch.zeros(1, device=dev)
+        loss_box   = torch.zeros(1, device=dev)
+        loss_angle = torch.zeros(1, device=dev)
+        loss_depth = torch.zeros(1, device=dev)
+        loss_hgt   = torch.zeros(1, device=dev)
+        n_pos      = 0
 
-        loss = (2.0 * loss_ce +
-                5.0 * loss_center +
-                2.0 * loss_size +
-                1.0 * loss_rot +
-                5.0 * loss_corner)
+        for out, stride in zip(level_outs, self.STRIDES):
+            B, _, H, W = out['cls'].shape
+            anc = self._anchors(H, W, stride, dev)   # (M, 2)
 
-        return loss, {
-            "loss": loss.detach(),
-            "ce": loss_ce.detach(),
-            "center": loss_center.detach(),
-            "size": loss_size.detach(),
-            "rot": loss_rot.detach(),
-            "corner": loss_corner.detach(),
-        }
+            for b in range(B):
+                gt = targets[b]['rboxes'].to(dev)    # (N, 5)
+                assign = self._assign(gt, anc)       # (M,)
 
-    def training_step(self, batch, batch_idx):
+                # --- cls loss (all anchors) ---
+                cls_flat = out['cls'][b, 0].flatten()          # (M,)
+                cls_tgt  = (assign >= 0).float()
+                loss_cls = loss_cls + focal_loss(cls_flat, cls_tgt)
+
+                pos = assign >= 0
+                if pos.sum() == 0:
+                    continue
+
+                n_pos   += pos.sum().item()
+                gi       = assign[pos]               # matched GT indices (P,)
+                gt_pos   = gt[gi]                    # (P, 5)
+
+                # predicted values at positive anchors
+                def _get(key):
+                    return out[key][b, 0].flatten()[pos]   # (P,)
+
+                pcx, pcy, pw, ph = _get('cx'), _get('cy'), _get('w'), _get('h')
+                psin, pcos       = _get('sin_a'), _get('cos_a')
+                pdep, phgt       = _get('depth'), _get('height3d')
+
+                # box L1 (normalised by image size)
+                loss_box = loss_box + (
+                    F.l1_loss(pcx / S, gt_pos[:, 0] / S) +
+                    F.l1_loss(pcy / S, gt_pos[:, 1] / S) +
+                    F.l1_loss(pw  / S, gt_pos[:, 2] / S) +
+                    F.l1_loss(ph  / S, gt_pos[:, 3] / S)
+                )
+
+                # angle L1 on (sin, cos)
+                gsin = torch.sin(gt_pos[:, 4])
+                gcos = torch.cos(gt_pos[:, 4])
+                loss_angle = loss_angle + F.l1_loss(psin, gsin) + F.l1_loss(pcos, gcos)
+
+                # depth & 3D height  (sizes[:,0] = d01 = box height)
+                gt_dep = targets[b]['depths'][gi, 0].to(dev)    # (P,)
+                gt_hgt = targets[b]['sizes'][gi, 0].to(dev)     # (P,) d01 = vertical height
+                loss_depth = loss_depth + F.l1_loss(pdep, gt_dep)
+                loss_hgt   = loss_hgt   + F.l1_loss(phgt, gt_hgt)
+
+        # average over batch × levels (focal loss is already mean-reduced)
+        n_lvl = len(self.STRIDES)
+        B     = level_outs[0]['cls'].shape[0]
+        norm  = float(B * n_lvl)
+
+        loss_cls   = loss_cls   / norm
+        loss_box   = loss_box   / norm
+        loss_angle = loss_angle / norm
+        loss_depth = loss_depth / norm
+        loss_hgt   = loss_hgt   / norm
+
+        loss = (1.0 * loss_cls   +
+                5.0 * loss_box   +
+                2.0 * loss_angle +
+                3.0 * loss_depth +
+                2.0 * loss_hgt)
+
+        logs = dict(
+            loss=loss.detach().squeeze(),
+            cls =loss_cls.detach().squeeze(),
+            box =loss_box.detach().squeeze(),
+            angle=loss_angle.detach().squeeze(),
+            depth=loss_depth.detach().squeeze(),
+            height=loss_hgt.detach().squeeze(),
+        )
+        return loss, logs
+
+    # ------------------------------------------------------------------
+    def training_step(self, batch, _):
         imgs, targets = batch
-        out = self.model(imgs)
-        loss, logs = self.compute_loss(out, targets)
+        loss, logs = self.compute_loss(self.model(imgs), targets)
         for k, v in logs.items():
             self.log(f"train/{k}", v, prog_bar=(k == "loss"), batch_size=imgs.size(0))
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, _):
         imgs, targets = batch
-        out = self.model(imgs)
-        loss, logs = self.compute_loss(out, targets)
+        loss, logs = self.compute_loss(self.model(imgs), targets)
         for k, v in logs.items():
             self.log(f"val/{k}", v, prog_bar=(k == "loss"), batch_size=imgs.size(0))
         return loss
 
     def configure_optimizers(self):
         backbone_params = list(self.model.backbone.parameters())
-        backbone_ids = {id(p) for p in backbone_params}
-        other_params = [p for p in self.model.parameters() if id(p) not in backbone_ids]
+        bids = {id(p) for p in backbone_params}
+        other = [p for p in self.model.parameters() if id(p) not in bids]
 
-        optim = torch.optim.AdamW([
+        opt = torch.optim.AdamW([
             {"params": backbone_params, "lr": self.hparams.lr * 0.1},
-            {"params": other_params, "lr": self.hparams.lr},
+            {"params": other,           "lr": self.hparams.lr},
         ], weight_decay=self.hparams.weight_decay)
 
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=100)
-        return {"optimizer": optim, "lr_scheduler": sched}
+        warmup = torch.optim.lr_scheduler.LinearLR(opt, 0.1, 1.0, total_iters=10)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=190)
+        sched  = torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], milestones=[10])
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}

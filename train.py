@@ -48,7 +48,7 @@ def main():
     callbacks = [
         ModelCheckpoint(
             dirpath=args.ckpt_dir,
-            filename="parcel3d-{epoch:03d}-{val/loss:.4f}",
+            filename="parcel3d",
             monitor="val/loss", mode="min", save_top_k=3,
             auto_insert_metric_name=False,
         ),

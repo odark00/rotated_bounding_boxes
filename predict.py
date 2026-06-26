@@ -214,27 +214,44 @@ def predict(ckpt, image_path, conf_thresh=0.5, intrinsics=None, out_path="predic
             angles[i],
             edgecolor='lime', linewidth=2,
         )
-        ax1.text(dets['cx'][i]*sx_v, dets['cy'][i]*sy_v - dets['h'][i]*sy_v*0.6,
-                 f"{dets['scores'][i]:.2f}", color='yellow', fontsize=8, ha='center')
+        # ax1.text(dets['cx'][i]*sx_v, dets['cy'][i]*sy_v - dets['h'][i]*sy_v*0.6,
+        #          f"{dets['scores'][i]:.2f}", color='yellow', fontsize=8, ha='center')
     ax1.set_title("2D rotated boxes")
     ax1.axis("off")
 
     # --- 3D boxes ---
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
+    colors = plt.cm.tab10(np.linspace(0, 0.9, max(N, 1)))
+
     for i in range(N):
         corners = build_corners_3d(
             dets['cx'][i], dets['cy'][i], dets['depth'][i],
             W3d[i], L3d[i], H3d[i], angles[i],
             fx_m, fy_m, cx_m, cy_m,
         )
-        # project to original image for 3D-on-image overlay (optional)
+        col = colors[i]
         polys = [[corners[j] for j in face] for face in FACES]
-        ax2.add_collection3d(Poly3DCollection(polys, alpha=0.2,
-                                               edgecolor='k', facecolor='cyan'))
-        ax2.scatter(corners[:,0], corners[:,1], corners[:,2], s=10)
+        ax2.add_collection3d(Poly3DCollection(polys, alpha=0.15,
+                                               edgecolor=col, facecolor=col))
+
+        # dimension labels on sides:
+        #   W: midpoint of edge 0→1  (top face, width direction)
+        #   L: midpoint of edge 1→2  (top face, length direction)
+        #   H: midpoint of edge 0→4  (vertical pillar)
+        def mid(a, b): return (corners[a] + corners[b]) / 2
+        meters_val = 1000
+        width = W3d[i]*meters_val
+        length = L3d[i]*meters_val
+        height = H3d[i]*meters_val
+        ax2.text(*mid(0,1), f"W={width:.1f}cm",
+                 color='black', fontsize=11, ha='center', va='bottom')
+        ax2.text(*mid(1,2), f"L={length:.1f}cm",
+                 color='black', fontsize=11, ha='center', va='bottom')
+        ax2.text(*mid(0,4), f"H={height:.1f}cm",
+                 color='black', fontsize=11, ha='center', va='bottom')
 
     ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z (depth)")
-    ax2.set_title("3D boxes (OpenCV frame, Z forward)")
+    ax2.set_title("3D bounding boxes")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
     print(f"\nSaved → {out_path}")

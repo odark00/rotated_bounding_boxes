@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.ckpt
+checkpoints*/
+tb_logs/
+csv_logs/
+*.log
+package_dims/datasets/
+package_dims/predictions/
